@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/icon.png" width="96" alt="MenuBarTidy 아이콘"></p>
+
 # MenuBarTidy
 
 메뉴바 아이콘이 많아서 노치에 가릴 때, 안 쓰는 아이콘을 숨기고 필요할 때 **아래로 펼쳐서** 쓰는 가벼운 macOS 메뉴바 정리 앱입니다.
@@ -6,6 +8,16 @@ A tiny macOS menu bar manager: hide icons behind a divider and open hidden or no
 
 - macOS 14 (Sonoma) 이상, 애플 실리콘·인텔 모두 지원
 - Swift 한 파일, 외부 라이브러리 없음
+
+## 어떻게 생겼나
+
+**평소 메뉴바** — 안 쓰는 아이콘은 숨겨지고 `‹` 버튼만 남습니다.
+
+![평소 메뉴바](docs/menubar.png)
+
+**`‹` 클릭** — 숨은 아이콘과 노치에 가린 아이콘이 아래로 펼쳐집니다. 누르면 그 앱이 열리고, `⋯`는 설정입니다.
+
+![아래로 펼친 아이콘](docs/grid.png)
 
 ## 설치
 
