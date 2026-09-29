@@ -1,0 +1,4 @@
+MenuBarTidy.app/
+dist/
+*.iconset/
+.DS_Store
