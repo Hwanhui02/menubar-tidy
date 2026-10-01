@@ -63,7 +63,16 @@ final class Tidy: NSObject, NSApplicationDelegate {
         // 숨김 상태(화면 밖)의 위치는 실제 순서와 어긋날 때가 있어서, 펼쳐졌을 때의 순서를 기록해 둔다.
         if !h && AXIsProcessTrusted() {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                if !self.hidden { self.barOrder = self.menuBarItems().map(\.name) }
+                guard !self.hidden else { return }
+                let items = self.menuBarItems()
+                self.barOrder = items.map(\.name)
+                // 펼쳐서 보이는 동안 아직 모양을 못 찍은 아이콘을 찍어 둔다(macOS 27은 이때만 가능).
+                let missing = items.filter { self.iconCache[$0.name] == nil && self.isVisible($0) }
+                if !missing.isEmpty && CGPreflightScreenCaptureAccess() {
+                    Task { @MainActor in
+                        for (j, img) in await self.capture(missing) { self.iconCache[missing[j].name] = img }
+                    }
+                }
             }
         }
         toggle.button?.image = NSImage(systemSymbolName: h ? "chevron.left" : "chevron.right",
@@ -197,10 +206,13 @@ final class Tidy: NSObject, NSApplicationDelegate {
         clickMonitor = nil
     }
 
-    // 화면 안에 있고 노치에도 안 걸린 항목만 "보이는" 것으로 본다.
+    var overflowMaxX: CGFloat?  // macOS 27 시스템 «의 오른쪽 끝. 그보다 왼쪽 항목은 시스템이 가린 것
+
+    // 화면 안에 있고 노치·시스템 «에도 안 걸린 항목만 "보이는" 것으로 본다.
     func isVisible(_ it: Item) -> Bool {
         guard let scr = NSScreen.screens.first else { return true }
         let f = it.frame
+        if let o = overflowMaxX, f.minX < o { return false }
         if f.minX < scr.frame.minX || f.maxX > scr.frame.maxX { return false }
         if let l = scr.auxiliaryTopLeftArea, let r = scr.auxiliaryTopRightArea,
            f.maxX > l.maxX, f.minX < r.minX { return false }
@@ -219,9 +231,25 @@ final class Tidy: NSObject, NSApplicationDelegate {
         let bar = content.windows.filter { $0.windowLayer == 25 }  // kCGStatusWindowLevel
         let scale = NSScreen.screens.first?.backingScaleFactor ?? 2
         var out: [Int: NSImage] = [:]
+        let scr = NSScreen.screens.first
+        let id = scr?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
+        let display = content.displays.first { $0.displayID == id }
         for (i, it) in items.enumerated() {
             guard let w = bar.first(where: { abs($0.frame.minX - it.frame.minX) < 2
-                                             && abs($0.frame.width - it.frame.width) < 2 }) else { continue }
+                                             && abs($0.frame.width - it.frame.width) < 2 }) else {
+                // macOS 27은 아이콘마다 창이 따로 없다 → 화면에 보이는 아이콘만 그 자리를 찍는다.
+                guard let display, isVisible(it) else { continue }
+                let cfg = SCStreamConfiguration()
+                cfg.sourceRect = it.frame
+                cfg.width = Int(it.frame.width * scale)
+                cfg.height = Int(it.frame.height * scale)
+                cfg.showsCursor = false
+                if let cg = try? await SCScreenshotManager.captureImage(
+                    contentFilter: SCContentFilter(display: display, excludingWindows: []), configuration: cfg) {
+                    out[i] = NSImage(cgImage: cg, size: it.frame.size)
+                }
+                continue
+            }
             let cfg = SCStreamConfiguration()
             cfg.width = Int(w.frame.width * scale)
             cfg.height = Int(w.frame.height * scale)
@@ -376,15 +404,29 @@ final class Tidy: NSObject, NSApplicationDelegate {
 
     func menuBarItems() -> [Item] {
         var all: [Item] = []
+        overflowMaxX = nil
         let known = barPIDs
         for app in NSWorkspace.shared.runningApplications where known.isEmpty || known.contains(app.processIdentifier) {
             let a = AXUIElementCreateApplication(app.processIdentifier)
             AXUIElementSetMessagingTimeout(a, 0.1)
             guard let bar: AXUIElement = attr(a, "AXExtrasMenuBar"),
                   let kids: [AXUIElement] = attr(bar, kAXChildrenAttribute) else { continue }
-            let isCC = app.bundleIdentifier == "com.apple.controlcenter"
+            // 시스템 항목(배터리·시계 등)을 그리는 쪽: macOS 26은 제어 센터, 27은 MenuBarAgent
+            let isCC = app.bundleIdentifier == "com.apple.controlcenter" || app.bundleIdentifier == "com.apple.MenuBarAgent"
             let appName = app.localizedName ?? "?"
             for k in kids {
+                var acts: CFArray?
+                AXUIElementCopyActionNames(k, &acts)
+                guard (acts as? [String] ?? []).contains(kAXPressAction) else {
+                    // 누를 수 없는 항목. macOS 27의 시스템 «(가려진 항목 보기) 버튼이 이것 — 위치만 기억한다.
+                    if isCC, let v: AXValue = attr(k, kAXPositionAttribute) {
+                        var p = CGPoint.zero; AXValueGetValue(v, .cgPoint, &p)
+                        var sz = CGSize.zero
+                        if let w: AXValue = attr(k, kAXSizeAttribute) { AXValueGetValue(w, .cgSize, &sz) }
+                        if sz.width > 0 { overflowMaxX = p.x + sz.width }
+                    }
+                    continue
+                }
                 let desc = (attr(k, kAXDescriptionAttribute) as String?)
                     ?? (attr(k, kAXTitleAttribute) as String?) ?? ""
                 if isCC && desc.isEmpty { continue }  // 제어 센터의 이름 없는 빈 자리 항목(x=0)
@@ -399,17 +441,13 @@ final class Tidy: NSObject, NSApplicationDelegate {
             }
         }
         // macOS 26은 제어 센터가 다른 앱 아이콘까지 대신 그려서 같은 항목이 두 번 잡힌다.
-        // 위치로 합치고 원래 앱 쪽을 남긴다.
-        var byX: [Int: Item] = [:]
-        for it in all {
-            let key = Int(it.frame.minX.rounded())
-            if let old = byX[key], !old.isCC { continue }
-            byX[key] = it
-        }
-        let own = [toggle, divider].compactMap { $0.button?.window?.frame.minX }
-        return byX.values
+        // 같은 자리에 원래 앱 항목이 있으면 제어 센터 쪽을 버린다. (27은 숨은 항목들이 « 뒤에
+        // 비슷한 x로 겹쳐 있어서, 앱 항목끼리는 위치가 같아도 합치지 않는다.)
+        let appX = Set(all.filter { !$0.isCC }.map { Int($0.frame.minX.rounded()) })
+        return all
             .filter { it in it.frame.width > 0 && it.frame.width < 500
-                      && !own.contains { abs($0 - it.frame.minX) < 2 } }
+                      && it.app.processIdentifier != getpid()  // 우리 ‹ │
+                      && !(it.isCC && appX.contains(Int(it.frame.minX.rounded()))) }
             .sorted { $0.frame.minX < $1.frame.minX }
     }
 
